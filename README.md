@@ -1,0 +1,1 @@
+# TradingView-GMOcoin-bot
