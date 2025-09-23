@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+pybotters
+httpx
+pydantic
+python-dotenv
+orjson
+uvloop; platform_system == "Linux"
