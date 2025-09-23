@@ -1,0 +1,30 @@
+version: "3.9"
+
+services:
+  exec-lane:
+    build:
+      context: ./exec-lane
+    env_file:
+      - ./config/.env
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    volumes:
+      - ./exec-lane/runtime.db:/app/runtime.db
+    environment:
+      - PYTHONUNBUFFERED=1
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+# Example of optional uptime monitoring service
+#  kuma:
+#    image: louislam/uptime-kuma:1
+#    container_name: uptime-kuma
+#    volumes:
+#      - ./kuma-data:/app/data
+#    ports:
+#      - "3001:3001"
+#    restart: unless-stopped
