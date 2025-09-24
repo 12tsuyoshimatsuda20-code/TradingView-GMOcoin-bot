@@ -1,0 +1,19 @@
+services:
+  exec-lane:
+    build:
+      context: ./exec-lane
+      dockerfile: Dockerfile
+    container_name: exec-lane
+    env_file:
+      - ./config/.env
+    volumes:
+      - ./config/.env:/app/config/.env:ro
+      - ./logs:/logs
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
