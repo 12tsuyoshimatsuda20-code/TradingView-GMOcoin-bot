@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from decimal import Decimal, ROUND_DOWN
+from typing import Any, Dict, List, Optional, Tuple
 
 import pybotters
 from loguru import logger
@@ -39,7 +40,14 @@ class GMOCoinClient:
         self._status_store = status_store
         self._rest_timeout = rest_timeout
 
-    async def _request(self, method: str, path: str, *, params: Dict[str, Any] | None = None, json_body: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Dict[str, Any] | None = None,
+        json_body: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
         url = f"{self.BASE_URL}{path}"
         backoff = [0.5, 1.0, 2.0]
         for attempt, delay in enumerate(backoff, start=1):
@@ -106,29 +114,66 @@ class GMOCoinClient:
         await self._status_store.set_position(0.0, "FLAT")
         return PositionSummary(side="FLAT", size=0.0)
 
-    async def fetch_settlement_size(self, symbol: str) -> Tuple[float, float]:
-        data = await self._request("GET", "/private/v1/openPositions", params={"symbol": symbol})
+    async def fetch_settlement_size(
+        self, symbol: str
+    ) -> Tuple[float, float, List[Dict[str, str]]]:
+        data = await self._request(
+            "GET", "/private/v1/openPositions", params={"symbol": symbol}
+        )
         entries = data.get("data") or {}
         positions = entries.get("list") or entries.get("openPositions") or []
-        total_size = 0.0
-        settable = 0.0
+        total_size = Decimal("0")
+        settable = Decimal("0")
+        settle_payload: List[Dict[str, str]] = []
         for entry in positions:
-            size = float(entry.get("size") or entry.get("quantity") or 0.0)
-            total_size += size
-            settable_entry = entry.get("settleQuantity") or entry.get("settableQuantity")
-            if settable_entry is not None:
-                settable += float(settable_entry)
-            else:
-                settable += size
-        return total_size, settable
+            raw_size = entry.get("size") or entry.get("quantity") or 0.0
+            size_dec = Decimal(str(raw_size))
+            if size_dec <= 0:
+                continue
+            position_id = entry.get("positionId") or entry.get("position_id") or entry.get("positionNo")
+            if not position_id:
+                continue
+            settle_entry_raw = entry.get("settleQuantity") or entry.get("settableQuantity")
+            settle_dec = (
+                Decimal(str(settle_entry_raw)) if settle_entry_raw is not None else size_dec
+            )
+            if settle_dec > size_dec:
+                settle_dec = size_dec
+            quantized_total = size_dec.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+            if quantized_total <= 0:
+                continue
+            total_size += quantized_total
+            quantized_settle = settle_dec.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+            if quantized_settle <= 0:
+                continue
+            settable += quantized_settle
+            settle_payload.append(
+                {
+                    "positionId": str(position_id),
+                    "size": format(quantized_settle, ".2f"),
+                }
+            )
+        return float(total_size), float(settable), settle_payload
 
-    async def place_market_order(self, *, symbol: str, side: str, size: float) -> OrderResult:
-        payload = {
+    async def place_market_order(
+        self,
+        *,
+        symbol: str,
+        side: str | None = None,
+        size: float | Decimal | None = None,
+        settle_position: List[Dict[str, str]] | None = None,
+    ) -> OrderResult:
+        payload: Dict[str, Any] = {
             "symbol": symbol,
-            "side": side,
             "executionType": "MARKET",
-            "size": f"{size:.8f}",
         }
+        if side is not None:
+            payload["side"] = side
+        if size is not None:
+            size_dec = Decimal(str(size)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+            payload["size"] = format(size_dec, ".2f")
+        if settle_position:
+            payload["settlePosition"] = settle_position
         data = await self._request("POST", "/private/v1/order", json_body=payload)
         status_value = data.get("status")
         if status_value not in (0, "0", "SUCCESS", "success"):

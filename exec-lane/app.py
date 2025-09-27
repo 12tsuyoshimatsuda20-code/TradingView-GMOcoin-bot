@@ -182,7 +182,7 @@ async def process_entry(payload: EntryPayload, request: Request) -> Dict[str, An
         order_result = await gmo_client.place_market_order(
             symbol=payload.symbol,
             side=payload.side,
-            size=float(qty),
+            size=qty,
         )
     except Exception as exc:
         await notifier.notify_error(event_id=payload.event_id, message=str(exc))
@@ -235,24 +235,64 @@ async def process_close(payload: ClosePayload, request: Request) -> Dict[str, An
         return {"already_flat": True}
 
     close_side = "SELL" if current.side == "BUY" else "BUY"
-    total_size, settable_size = await gmo_client.fetch_settlement_size(payload.symbol)
-    qty = min(current.size, settable_size if settable_size > 0 else current.size)
+    total_size, settable_size, settle_payload = await gmo_client.fetch_settlement_size(
+        payload.symbol
+    )
+    if not settle_payload:
+        logger.info(
+            "CLOSE ignored because no open positions returned",
+            extra={"event_id": payload.event_id},
+        )
+        return {"already_flat": True}
+
+    qty = total_size if total_size > 0 else current.size
+
+    def shrink_settle_positions(
+        entries: list[dict[str, str]], target: float
+    ) -> list[dict[str, str]]:
+        remaining = Decimal(str(target))
+        shrunk: list[dict[str, str]] = []
+        for item in entries:
+            if remaining <= 0:
+                break
+            size_dec = Decimal(item["size"])
+            use = size_dec if size_dec <= remaining else remaining
+            quantized = use.quantize(settings.qty_step, rounding=ROUND_DOWN)
+            if quantized <= 0:
+                continue
+            shrunk.append(
+                {
+                    "positionId": item["positionId"],
+                    "size": format(quantized, ".2f"),
+                }
+            )
+            remaining -= quantized
+        return shrunk
 
     started = time.perf_counter()
     try:
-        await gmo_client.place_market_order(symbol=payload.symbol, side=close_side, size=qty)
+        await gmo_client.place_market_order(
+            symbol=payload.symbol,
+            side=close_side,
+            settle_position=settle_payload,
+        )
     except RuntimeError as exc:
-        if "ERR-200" in str(exc) and settable_size < current.size and settable_size > 0:
+        if "ERR-200" in str(exc) and settable_size < total_size and settable_size > 0:
             logger.warning(
                 "Settlement limited, retrying with settable size",
                 extra={"event_id": payload.event_id, "settable": settable_size},
             )
+            trimmed = shrink_settle_positions(settle_payload, settable_size)
+            if not trimmed:
+                await notifier.notify_error(event_id=payload.event_id, message="no settle qty available")
+                raise HTTPException(status_code=400, detail="no_settle_quantity")
             await gmo_client.place_market_order(
                 symbol=payload.symbol,
                 side=close_side,
-                size=settable_size,
+                settle_position=trimmed,
             )
             qty = settable_size
+            settle_payload = trimmed
         else:
             await notifier.notify_error(event_id=payload.event_id, message=str(exc))
             raise HTTPException(status_code=500, detail="close_failed") from exc
