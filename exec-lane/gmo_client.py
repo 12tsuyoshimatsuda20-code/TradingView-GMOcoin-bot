@@ -107,7 +107,7 @@ class GMOCoinClient:
         path: str,
         *,
         params: Dict[str, Any] | None = None,
-        json_body: Dict[str, Any] | None = None,
+        json: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         url = f"{self.BASE_URL}{path}"
         backoff = [0.5, 1.0, 2.0]
@@ -117,7 +117,7 @@ class GMOCoinClient:
                     method,
                     url,
                     params=params,
-                    json=json_body,
+                    json=json,
                     timeout=self._rest_timeout,
                 ) as resp:
                     text = await resp.text()
@@ -154,7 +154,7 @@ class GMOCoinClient:
                     return data
             except Exception as exc:
                 if attempt == len(backoff):
-                    logger.exception("REST request failed", exc_info=exc)
+                    logger.exception("REST request failed")
                     raise
                 await self._status_store.incr_retry("rest")
                 logger.warning(
@@ -299,7 +299,7 @@ class GMOCoinClient:
         }
         if cash_margin_type:
             payload["cashMarginType"] = cash_margin_type
-        data = await self._request("POST", "/private/v1/order", json_body=payload)
+        data = await self._request("POST", "/private/v1/order", json=payload)
         order_data = data.get("data") or {}
         order_id = order_data.get("orderId") or order_data.get("order_id") or ""
         return OrderResult(order_id=order_id, status=str(data.get("status")), data=order_data)
@@ -318,7 +318,7 @@ class GMOCoinClient:
         }
         if cash_margin_type:
             payload["cashMarginType"] = cash_margin_type
-        data = await self._request("POST", "/private/v1/order", json_body=payload)
+        data = await self._request("POST", "/private/v1/order", json=payload)
         order_data = data.get("data") or {}
         order_id = order_data.get("orderId") or order_data.get("order_id") or ""
         closed_qty = sum(Decimal(item["size"]) for item in settle_position)
@@ -329,7 +329,7 @@ class GMOCoinClient:
         )
 
     async def cancel_all(self, symbol: str) -> None:
-        await self._request("DELETE", "/private/v1/cancelOrders", json_body={"symbol": symbol})
+        await self._request("DELETE", "/private/v1/cancelOrders", json={"symbol": symbol})
 
     async def wait_for_position(
         self,

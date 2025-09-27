@@ -28,8 +28,8 @@ class DiscordNotifier:
                         "Discord webhook failed",
                         extra={"status": resp.status, "body": body},
                     )
-        except Exception as exc:  # pragma: no cover - network failure logging
-            logger.exception("Failed to post Discord notification", exc_info=exc)
+        except Exception:  # pragma: no cover - network failure logging
+            logger.exception("Failed to post Discord notification")
 
     async def notify_entry_ok(
         self,
