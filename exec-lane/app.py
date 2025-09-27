@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+import contextlib
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
@@ -88,18 +89,15 @@ async def lifespan(app: FastAPI):
     )
 
     http_timeout = aiohttp.ClientTimeout(total=15)
+    # Notifier用の aiohttp セッション（Discord専用）
     notifier_session = aiohttp.ClientSession(timeout=http_timeout)
     status_store = StatusStore()
     notifier = DiscordNotifier(notifier_session, settings.notify_discord_webhook_url)
     idempotency = IdempotencyStore(Path("/app/logs/runtime.db"))
 
+    # pybotters は apis を (API_KEY, API_SECRET) のタプルで渡す
     pyb_client = pybotters.Client(
-        apis={
-            "gmocoin": {
-                "key": settings.gmo_api_key,
-                "secret": settings.gmo_api_secret,
-            }
-        },
+        apis={"gmocoin": (settings.gmo_api_key, settings.gmo_api_secret)}
     )
     gmo_client = GMOCoinClient(pyb_client, status_store)
 
@@ -113,8 +111,10 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        await pyb_client.close()
-        await notifier_session.close()
+        with contextlib.suppress(Exception):
+            await pyb_client.close()
+        with contextlib.suppress(Exception):
+            await notifier_session.close()
 
 
 app.router.lifespan_context = lifespan
