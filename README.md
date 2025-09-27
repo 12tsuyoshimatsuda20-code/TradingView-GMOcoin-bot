@@ -115,6 +115,15 @@ logs/
 - CLOSE operations handle GMO ERR-200 by retrying once with the settable quantity.
 - Structured JSON logs are written to stdout. Mount `/app/logs` for SQLite runtime data.
 - Optional: provide `NOTIFY_DISCORD_WEBHOOK_URL` in `.env` for production notifications.
+- When `ENV=dev`, failed GMO API requests surface `{detail, gmo:{code,msg}}` in HTTP responses for debugging; production keeps responses generic.
+
+## GMO Coin REST specifics
+
+- Use a **leverage** account API key/secret—spot credentials cannot place leveraged orders.
+- Both ENTRY and CLOSE requests hit `POST /private/v1/order` with signed parameters handled by pybotters.
+- ENTRY payloads include `symbol=BTC_JPY`, `side`, `executionType=MARKET`, and a size string rounded down to `QTY_STEP` (0.01).
+- CLOSE payloads omit `side` and instead send `settlePosition=[{"positionId": "...", "size": "..."}, ...]` gathered from `/private/v1/openPositions`.
+- GMO returns business errors with `status != 0` and message codes such as `ERR-200` or `ERR-5010`; these are logged (status/body/message codes) and forwarded to Discord notifications.
 
 ## Cloud deployment tips
 

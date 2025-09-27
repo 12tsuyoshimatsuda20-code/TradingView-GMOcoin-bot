@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse
 from loguru import logger
 from pydantic import BaseSettings, Field, validator
 
-from .gmo_client import GMOCoinClient
+from .gmo_client import GMOBusinessError, GMOCoinClient
 from .notify import DiscordNotifier
 from .store import IdempotencyStore, StatusStore
 from .validators import ClosePayload, EntryPayload
@@ -99,7 +99,7 @@ async def lifespan(app: FastAPI):
     pyb_client = pybotters.Client(
         apis={"gmocoin": (settings.gmo_api_key, settings.gmo_api_secret)}
     )
-    gmo_client = GMOCoinClient(pyb_client, status_store)
+    gmo_client = GMOCoinClient(pyb_client, status_store, qty_step=settings.qty_step)
 
     app.state.notifier_session = notifier_session
     app.state.status_store = status_store
@@ -179,13 +179,42 @@ async def process_entry(payload: EntryPayload, request: Request) -> Dict[str, An
 
     started = time.perf_counter()
     try:
-        order_result = await gmo_client.place_market_order(
+        order_result = await gmo_client.place_market_entry(
             symbol=payload.symbol,
             side=payload.side,
             size=qty,
         )
+    except GMOBusinessError as exc:
+        await notifier.notify_error(
+            event_id=payload.event_id,
+            mode=payload.mode,
+            symbol=payload.symbol,
+            side=payload.side,
+            size=float(qty),
+            message_code=exc.primary_code,
+            message_string=exc.primary_message,
+            detail=str(exc),
+        )
+        status_code = 400 if settings.env == "dev" else 500
+        detail_payload: Dict[str, Any] = {"detail": "order_failed"}
+        if settings.env == "dev":
+            detail_payload["gmo"] = {
+                "code": exc.primary_code,
+                "msg": exc.primary_message,
+            }
+            raise HTTPException(status_code=status_code, detail=detail_payload) from exc
+        raise HTTPException(status_code=status_code, detail="order_failed") from exc
     except Exception as exc:
-        await notifier.notify_error(event_id=payload.event_id, message=str(exc))
+        await notifier.notify_error(
+            event_id=payload.event_id,
+            mode=payload.mode,
+            symbol=payload.symbol,
+            side=payload.side,
+            size=float(qty),
+            message_code=None,
+            message_string=None,
+            detail=str(exc),
+        )
         raise HTTPException(status_code=500, detail="order_failed") from exc
 
     summary = await gmo_client.wait_for_position(
@@ -245,57 +274,125 @@ async def process_close(payload: ClosePayload, request: Request) -> Dict[str, An
         )
         return {"already_flat": True}
 
-    qty = total_size if total_size > 0 else current.size
+    qty = total_size if total_size > 0 else Decimal(str(current.size))
+    qty = truncate_size(float(qty), settings.qty_step)
 
     def shrink_settle_positions(
-        entries: list[dict[str, str]], target: float
+        entries: list[dict[str, str]], target: Decimal
     ) -> list[dict[str, str]]:
-        remaining = Decimal(str(target))
+        remaining = target
         shrunk: list[dict[str, str]] = []
+        decimals = max(-settings.qty_step.as_tuple().exponent, 0)
         for item in entries:
             if remaining <= 0:
                 break
             size_dec = Decimal(item["size"])
             use = size_dec if size_dec <= remaining else remaining
-            quantized = use.quantize(settings.qty_step, rounding=ROUND_DOWN)
+            quantized = truncate_size(float(use), settings.qty_step)
             if quantized <= 0:
                 continue
             shrunk.append(
                 {
                     "positionId": item["positionId"],
-                    "size": format(quantized, ".2f"),
+                    "size": f"{quantized:.{decimals}f}",
                 }
             )
             remaining -= quantized
         return shrunk
 
     started = time.perf_counter()
+    close_order_id: str | None = None
     try:
-        await gmo_client.place_market_order(
+        close_result = await gmo_client.place_close_order(
             symbol=payload.symbol,
-            side=close_side,
             settle_position=settle_payload,
         )
-    except RuntimeError as exc:
-        if "ERR-200" in str(exc) and settable_size < total_size and settable_size > 0:
+        close_order_id = close_result.order_id
+        qty = close_result.closed_qty
+    except GMOBusinessError as exc:
+        if (
+            exc.has_code("ERR-200")
+            and settable_size < total_size
+            and settable_size > 0
+        ):
             logger.warning(
                 "Settlement limited, retrying with settable size",
-                extra={"event_id": payload.event_id, "settable": settable_size},
+                extra={"event_id": payload.event_id, "settable": float(settable_size)},
             )
             trimmed = shrink_settle_positions(settle_payload, settable_size)
             if not trimmed:
-                await notifier.notify_error(event_id=payload.event_id, message="no settle qty available")
+                await notifier.notify_error(
+                    event_id=payload.event_id,
+                    mode=payload.mode,
+                    symbol=payload.symbol,
+                    side=close_side,
+                    size=float(qty),
+                    message_code="ERR-200",
+                    message_string="no settle qty available",
+                )
                 raise HTTPException(status_code=400, detail="no_settle_quantity")
-            await gmo_client.place_market_order(
+            try:
+                close_result = await gmo_client.place_close_order(
+                    symbol=payload.symbol,
+                    settle_position=trimmed,
+                )
+                close_order_id = close_result.order_id
+                qty = close_result.closed_qty
+                settle_payload = trimmed
+            except GMOBusinessError as retry_exc:
+                await notifier.notify_error(
+                    event_id=payload.event_id,
+                    mode=payload.mode,
+                    symbol=payload.symbol,
+                    side=close_side,
+                    size=float(qty),
+                    message_code=retry_exc.primary_code,
+                    message_string=retry_exc.primary_message,
+                    detail=str(retry_exc),
+                )
+                status_code = 400 if settings.env == "dev" else 500
+                detail_payload: Dict[str, Any] = {"detail": "close_failed"}
+                if settings.env == "dev":
+                    detail_payload["gmo"] = {
+                        "code": retry_exc.primary_code,
+                        "msg": retry_exc.primary_message,
+                    }
+                    raise HTTPException(status_code=status_code, detail=detail_payload) from retry_exc
+                raise HTTPException(status_code=status_code, detail="close_failed") from retry_exc
+        else:
+            await notifier.notify_error(
+                event_id=payload.event_id,
+                mode=payload.mode,
                 symbol=payload.symbol,
                 side=close_side,
-                settle_position=trimmed,
+                size=float(qty),
+                message_code=exc.primary_code,
+                message_string=exc.primary_message,
+                detail=str(exc),
             )
-            qty = settable_size
-            settle_payload = trimmed
-        else:
-            await notifier.notify_error(event_id=payload.event_id, message=str(exc))
-            raise HTTPException(status_code=500, detail="close_failed") from exc
+            status_code = 400 if settings.env == "dev" else 500
+            detail_payload: Dict[str, Any] = {"detail": "close_failed"}
+            if settings.env == "dev":
+                detail_payload["gmo"] = {
+                    "code": exc.primary_code,
+                    "msg": exc.primary_message,
+                }
+                raise HTTPException(status_code=status_code, detail=detail_payload) from exc
+            raise HTTPException(status_code=status_code, detail="close_failed") from exc
+    except Exception as exc:
+        await notifier.notify_error(
+            event_id=payload.event_id,
+            mode=payload.mode,
+            symbol=payload.symbol,
+            side=close_side,
+            size=float(qty),
+            message_code=None,
+            message_string=None,
+            detail=str(exc),
+        )
+        raise HTTPException(status_code=500, detail="close_failed") from exc
+
+    qty_float = float(qty)
 
     summary = await gmo_client.wait_for_position(
         symbol=payload.symbol,
@@ -307,7 +404,7 @@ async def process_close(payload: ClosePayload, request: Request) -> Dict[str, An
     await notifier.notify_close_ok(
         event_id=payload.event_id,
         closed_side=current.side,
-        closed_qty=qty,
+        closed_qty=qty_float,
         pnl=None,
         latency_ms=latency_ms,
     )
@@ -318,14 +415,16 @@ async def process_close(payload: ClosePayload, request: Request) -> Dict[str, An
             "mode": payload.mode,
             "symbol": payload.symbol,
             "closed_side": close_side,
-            "closed_qty": qty,
+            "closed_qty": qty_float,
             "latency_ms": latency_ms,
+            "order_id": close_order_id,
         },
     )
     return {
-        "closed_qty": qty,
+        "closed_qty": qty_float,
         "latency_ms": latency_ms,
         "position_flat": summary.size == 0,
+        "order_id": close_order_id,
     }
 
 
@@ -355,13 +454,26 @@ async def webhook(request: Request, settings: Settings = Depends(get_settings)):
         else:
             response = await process_close(payload, request)
         return response
-    except HTTPException:
+    except HTTPException as exc:
         await idempotency.remove_event(payload.event_id)
+        if isinstance(exc.detail, dict):
+            return JSONResponse(status_code=exc.status_code, content=exc.detail)
         raise
     except Exception as exc:
         await idempotency.remove_event(payload.event_id)
         notifier: DiscordNotifier = request.app.state.notifier
-        await notifier.notify_error(event_id=payload.event_id, message=str(exc))
+        side = payload.side if hasattr(payload, "side") else None
+        size = payload.size if hasattr(payload, "size") else None
+        await notifier.notify_error(
+            event_id=payload.event_id,
+            mode=payload.mode,
+            symbol=payload.symbol,
+            side=side,
+            size=size,
+            message_code=None,
+            message_string=None,
+            detail=str(exc),
+        )
         logger.exception("Webhook processing failed", extra={"event_id": payload.event_id})
         raise HTTPException(status_code=500, detail="internal_error")
 

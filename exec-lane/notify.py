@@ -31,7 +31,15 @@ class DiscordNotifier:
         except Exception as exc:  # pragma: no cover - network failure logging
             logger.exception("Failed to post Discord notification", exc_info=exc)
 
-    async def notify_entry_ok(self, *, event_id: str, side: str, size: float, price: float | None, latency_ms: float) -> None:
+    async def notify_entry_ok(
+        self,
+        *,
+        event_id: str,
+        side: str,
+        size: float,
+        price: float | None,
+        latency_ms: float,
+    ) -> None:
         price_part = f" @ {price:.0f} JPY" if price else ""
         content = (
             f"ENTRY OK | event={event_id} | side={side} | size={size:.2f} BTC{price_part}"
@@ -55,6 +63,29 @@ class DiscordNotifier:
         )
         await self._post(content)
 
-    async def notify_error(self, *, event_id: str, message: str) -> None:
-        content = f"ERROR | event={event_id} | {message}"
+    async def notify_error(
+        self,
+        *,
+        event_id: str,
+        mode: str,
+        symbol: str,
+        side: str | None,
+        size: float | str | None,
+        message_code: str | None,
+        message_string: str | None,
+        detail: str | None = None,
+    ) -> None:
+        size_text: str
+        if size is None:
+            size_text = "-"
+        else:
+            try:
+                size_text = f"{float(size):.2f}"
+            except (TypeError, ValueError):
+                size_text = str(size)
+        content = (
+            "ERROR | "
+            f"event={event_id} | mode={mode} | symbol={symbol} | side={side or '-'} | "
+            f"size={size_text} | code={message_code or '-'} | msg={message_string or detail or 'unknown'}"
+        )
         await self._post(content)
