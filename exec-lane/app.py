@@ -88,9 +88,9 @@ async def lifespan(app: FastAPI):
     )
 
     http_timeout = aiohttp.ClientTimeout(total=15)
-    session = aiohttp.ClientSession(timeout=http_timeout)
+    notifier_session = aiohttp.ClientSession(timeout=http_timeout)
     status_store = StatusStore()
-    notifier = DiscordNotifier(session, settings.notify_discord_webhook_url)
+    notifier = DiscordNotifier(notifier_session, settings.notify_discord_webhook_url)
     idempotency = IdempotencyStore(Path("/app/logs/runtime.db"))
 
     pyb_client = pybotters.Client(
@@ -100,11 +100,10 @@ async def lifespan(app: FastAPI):
                 "secret": settings.gmo_api_secret,
             }
         },
-        session=session,
     )
     gmo_client = GMOCoinClient(pyb_client, status_store)
 
-    app.state.http_session = session
+    app.state.notifier_session = notifier_session
     app.state.status_store = status_store
     app.state.notifier = notifier
     app.state.idempotency = idempotency
@@ -114,8 +113,8 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        await session.close()
         await pyb_client.close()
+        await notifier_session.close()
 
 
 app.router.lifespan_context = lifespan
