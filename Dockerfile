@@ -10,8 +10,10 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY exec-lane/requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt \
-    && python -c "import sys; import platform;\nif platform.system() == 'Linux':\n import subprocess; subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--no-cache-dir', 'uvloop==0.19.0'])"
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+# または：
+# RUN pip install --no-cache-dir -r /tmp/requirements.txt \
+#     && if [ "$(uname -s)" = "Linux" ]; then pip install --no-cache-dir uvloop==0.19.0; fi
 
 COPY exec-lane /app/exec-lane
 COPY config/gunicorn_conf.py /app/config/gunicorn_conf.py
