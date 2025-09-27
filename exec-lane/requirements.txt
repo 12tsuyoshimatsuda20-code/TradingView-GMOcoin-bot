@@ -1,0 +1,8 @@
+aiohttp==3.8.6
+uvicorn==0.30.6
+gunicorn==21.2.0
+fastapi==0.112.2
+pybotters==1.12.0
+python-dotenv==1.0.1
+pydantic==1.10.14
+loguru==0.7.2
