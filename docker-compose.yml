@@ -1,7 +1,7 @@
 services:
-  bot:
+  exec-lane:
     build: .
-    container_name: tradingview-gmocoin-bot
+    container_name: exec-lane
     restart: unless-stopped
     env_file:
       - ./config/.env

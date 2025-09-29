@@ -17,7 +17,7 @@ from loguru import logger
 from .domain import TradingService
 from .infra.gmocoin_client import GMOCoinAPIError, GMOCoinClient
 from .infra.positions import PositionsService
-from .notify import DiscordNotifier
+from .notify import notify_discord
 from .schemas import (
     HealthResponse,
     LastEventInfo,
@@ -107,7 +107,6 @@ class AppState:
     def __init__(self) -> None:
         self.settings: Settings
         self.store: EventStore
-        self.notifier: DiscordNotifier
         self.gmo_client: GMOCoinClient
         self.positions: PositionsService
         self.trading: TradingService
@@ -118,7 +117,6 @@ def create_app(
     settings: Optional[Settings] = None,
     *,
     store: Optional[EventStore] = None,
-    notifier: Optional[DiscordNotifier] = None,
     gmocoin_client: Optional[GMOCoinClient] = None,
     positions_service: Optional[PositionsService] = None,
 ) -> FastAPI:
@@ -135,7 +133,6 @@ def create_app(
     state = AppState()
     state.settings = settings
     state.store = store or EventStore(Path("data/bot.db"))
-    state.notifier = notifier or DiscordNotifier(settings.discord_webhook)
     state.gmo_client = gmocoin_client or GMOCoinClient(
         settings.gmo_api_key,
         settings.gmo_api_secret,
@@ -147,10 +144,27 @@ def create_app(
         entry_policy=settings.entry_policy,
         positions_service=state.positions,
         gmocoin_client=state.gmo_client,
-        notifier=state.notifier,
+        discord_webhook=settings.discord_webhook,
     )
     state.lock = asyncio.Lock()
     app.state.app_state = state
+
+    async def safe_notify(
+        title: str,
+        description: str,
+        color: str = "gray",
+        fields: list[dict] | None = None,
+    ) -> None:
+        try:
+            await notify_discord(
+                state.settings.discord_webhook,
+                title,
+                description,
+                color,
+                fields,
+            )
+        except Exception as exc:
+            logger.debug("Discord notify suppressed (main): {}", repr(exc))
 
     @app.exception_handler(WebhookError)
     async def webhook_error_handler(request: Request, exc: WebhookError) -> JSONResponse:
@@ -166,7 +180,6 @@ def create_app(
     @app.on_event("shutdown")
     async def on_shutdown() -> None:  # pragma: no cover - shutdown hook
         await state.store.close()
-        await state.notifier.close()
         await state.gmo_client.close()
         logger.info("Application shutdown complete")
 
@@ -255,13 +268,20 @@ def create_app(
                 return JSONResponse(status_code=status.HTTP_200_OK, content=response.model_dump())
             except GMOCoinAPIError as exc:
                 message = f"GMO Coin API error: {exc}"
-                await state.notifier.notify_error(payload.event_id, message)
                 await state.store.update_event(
                     payload.event_id,
                     status="failed",
                     action="error",
                     response={"status_code": exc.status_code, "payload": exc.payload},
                     error=message,
+                )
+                await safe_notify(
+                    "Execution error",
+                    f"event_id={payload.event_id}\\n{message}",
+                    "red",
+                    [
+                        {"name": "status_code", "value": str(exc.status_code), "inline": True},
+                    ],
                 )
                 return JSONResponse(
                     status_code=status.HTTP_502_BAD_GATEWAY,
@@ -270,12 +290,16 @@ def create_app(
             except Exception as exc:
                 message = f"Unhandled error: {exc}"
                 logger.exception("Unhandled error while processing webhook")
-                await state.notifier.notify_error(payload.event_id, message)
                 await state.store.update_event(
                     payload.event_id,
                     status="failed",
                     action="error",
                     error=message,
+                )
+                await safe_notify(
+                    "Execution error",
+                    f"event_id={payload.event_id}\\n{message}",
+                    "red",
                 )
                 return JSONResponse(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

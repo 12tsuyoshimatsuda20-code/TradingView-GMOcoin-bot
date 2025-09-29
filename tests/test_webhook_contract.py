@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Tuple
+from typing import Any, Dict
 
 import pytest
 from fastapi.testclient import TestClient
@@ -26,29 +26,6 @@ class DummyGMOCoinClient:
         return None
 
 
-class DummyNotifier:
-    def __init__(self) -> None:
-        self.messages: list[Tuple[str, Dict[str, Any]]] = []
-
-    async def notify_entry_success(self, event_id: str, side: str, size: float) -> None:
-        self.messages.append(("entry", {"event_id": event_id, "side": side, "size": size}))
-
-    async def notify_close_success(self, event_id: str, closed_side: str, size: float) -> None:
-        self.messages.append(("close", {"event_id": event_id, "side": closed_side, "size": size}))
-
-    async def notify_ignored(self, event_id: str, reason: str) -> None:
-        self.messages.append(("ignored", {"event_id": event_id, "reason": reason}))
-
-    async def notify_no_position(self, event_id: str) -> None:
-        self.messages.append(("noop", {"event_id": event_id}))
-
-    async def notify_error(self, event_id: str, message: str) -> None:
-        self.messages.append(("error", {"event_id": event_id, "message": message}))
-
-    async def close(self) -> None:  # pragma: no cover
-        return None
-
-
 class DummyPositionsService:
     def __init__(self) -> None:
         self.state = PositionState("NONE", 0.0)
@@ -58,7 +35,7 @@ class DummyPositionsService:
 
 
 @pytest.fixture
-def client(tmp_path):
+def client(tmp_path, monkeypatch):
     settings = Settings(
         webhook_token="token",
         gmo_api_key="key",
@@ -72,17 +49,39 @@ def client(tmp_path):
     )
     store = EventStore(tmp_path / "bot.db")
     gmo = DummyGMOCoinClient()
-    notifier = DummyNotifier()
     positions = DummyPositionsService()
+    notifications: list[Dict[str, Any]] = []
+
+    async def dummy_notify(
+        webhook_url: str | None,
+        title: str,
+        description: str,
+        color: str = "gray",
+        fields: list[dict] | None = None,
+        timeout_sec: float = 10.0,
+    ) -> None:
+        notifications.append(
+            {
+                "webhook_url": webhook_url,
+                "title": title,
+                "description": description,
+                "color": color,
+                "fields": fields or [],
+                "timeout": timeout_sec,
+            }
+        )
+
+    monkeypatch.setattr("app.domain.notify_discord", dummy_notify)
+    monkeypatch.setattr("app.main.notify_discord", dummy_notify)
+
     app = create_app(
         settings=settings,
         store=store,
-        notifier=notifier,
         gmocoin_client=gmo,
         positions_service=positions,
     )
     with TestClient(app) as test_client:
-        yield test_client, gmo, notifier, positions
+        yield test_client, gmo, notifications, positions
 
 
 def _payload(**overrides: Any) -> Dict[str, Any]:
@@ -106,7 +105,7 @@ def _payload(**overrides: Any) -> Dict[str, Any]:
 
 
 def test_entry_success(client):
-    test_client, gmo, notifier, positions = client
+    test_client, gmo, notifications, positions = client
     positions.state = PositionState("NONE", 0.0)
     response = test_client.post(
         "/webhook",
@@ -118,11 +117,11 @@ def test_entry_success(client):
     assert data["status"] == "ok"
     assert data["action"] == "entry"
     assert len(gmo.orders) == 1
-    assert notifier.messages[0][0] == "entry"
+    assert notifications[0]["title"] == "ENTRY executed"
 
 
 def test_duplicate_event_returns_duplicate_status(client):
-    test_client, gmo, notifier, positions = client
+    test_client, gmo, notifications, positions = client
     payload = _payload(event_id="dup-event")
     response = test_client.post(
         "/webhook", json=payload, headers={"Content-Type": "application/json"}
@@ -160,7 +159,7 @@ def test_timestamp_skew_rejected(client):
 
 
 def test_close_without_position_returns_noop(client):
-    test_client, gmo, notifier, positions = client
+    test_client, gmo, notifications, positions = client
     positions.state = PositionState("NONE", 0.0)
     payload = _payload(mode="CLOSE", side="SELL", event_id="close-test")
     response = test_client.post(
@@ -169,12 +168,12 @@ def test_close_without_position_returns_noop(client):
     assert response.status_code == 200
     data = response.json()
     assert data["action"] == "noop"
-    assert notifier.messages[-1][0] == "noop"
+    assert notifications[-1]["title"] == "CLOSE skipped"
     assert gmo.orders == []
 
 
 def test_entry_ignored_when_position_exists(client):
-    test_client, gmo, notifier, positions = client
+    test_client, gmo, notifications, positions = client
     positions.state = PositionState("BUY", 0.04)
     payload = _payload(event_id="ignore-test")
     response = test_client.post(
@@ -183,5 +182,5 @@ def test_entry_ignored_when_position_exists(client):
     assert response.status_code == 200
     data = response.json()
     assert data["action"] == "ignored"
-    assert notifier.messages[-1][0] == "ignored"
+    assert notifications[-1]["title"] == "ENTRY ignored"
     assert gmo.orders == []

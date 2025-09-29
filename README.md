@@ -120,10 +120,18 @@ We pin pybotters==1.9.1 to use an available wheel compatible with Python 3.11 an
 ## 運用上の注意
 - TradingView からの `ts` と受信時刻の差分が `MAX_SKEW_SECONDS`（デフォルト 60 秒）を超えると 400 を返します。ホストと TradingView 双方で NTP 同期を行ってください。
 - ENTRY_POLICY は `ignore` 固定です。建玉がある状態で ENTRY が届いた場合は通知のみ行い、発注は行いません。
-- Discord 通知は成功（緑）、無視・建玉なし（灰）、エラー（赤）で Embed を送信します。
+- Discord 通知は成功（緑）、無視・建玉なし（灰）、エラー（赤）で Embed を送信します。`DISCORD_WEBHOOK` を未設定（空文字）の場合は通知処理自体をスキップし、Bot の主要機能は継続します。
+- Discord 側で429/5xx/ネットワークタイムアウトなどが発生した場合でも WARNING ログを残して握り込み、FastAPI のレスポンスは成功・失敗いずれも適切な HTTP ステータスを維持します。URL 貼り間違いや Private チャンネル権限、企業プロキシでのブロックに注意してください。
 - SQLite (`data/bot.db`) には `event_id` を主キーとしてイベント履歴が記録されます。バックアップやローテーションが必要な場合は停止後にファイルを退避してください。
 - `.env` に設定する API キー・シークレットは平文保存となるため、アクセス権限を最小限にし、バージョン管理しないでください。
 - GMO API シークレット貼り付け時は余計な空白・改行が混入しないように十分確認してください。必要に応じて `printf %s "$GMO_API_SECRET" | wc -c` で文字数を検証できます。
+ 
+## ログ / 状態の確認例
+```bash
+docker compose ps --services
+docker compose logs -n 200 exec-lane | egrep -i 'ERROR|WARNING|traceback|exception' || true
+curl -sS http://127.0.0.1:8080/status | python -m json.tool
+```
 
 ## トラブルシュート
 | 事象 | 原因・対処 |
