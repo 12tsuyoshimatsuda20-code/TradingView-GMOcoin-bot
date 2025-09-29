@@ -56,6 +56,9 @@ TradingView Essential から送信される Webhook を受信し、pybotters を
 
    > **注意:** `.env` を Windows で編集した場合、CRLF が混入しているとシェル実行時に不具合が発生します。`dos2unix config/.env` を実行して LF に変換してください。
 
+## 依存ピンの理由
+We pin pybotters==1.9.1 to use an available wheel compatible with Python 3.11 and to align with aiohttp 3.11.x. Earlier pins like pybotters==0.21.1 do not exist on PyPI and cause build failures. During the Docker build we upgrade pip first so the resolver fully supports manylinux wheels and fails fast if incompatible packages are introduced.
+
 ## ビルドと起動
 1. コンテナをビルドしてバックグラウンドで起動します。
    ```bash
