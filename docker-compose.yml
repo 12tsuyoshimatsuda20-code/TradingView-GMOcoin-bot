@@ -1,0 +1,14 @@
+services:
+  exec-lane:
+    build: .
+    container_name: exec-lane
+    restart: unless-stopped
+    env_file:
+      - ./config/.env
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config:/app/config
+      - ./data:/app/data
+      - ./logs:/app/logs
+    user: "1000:1000"
