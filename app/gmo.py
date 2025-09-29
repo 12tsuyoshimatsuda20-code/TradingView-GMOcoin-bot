@@ -2,10 +2,39 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 import pybotters
 from loguru import logger
+
+try:  # pragma: no cover - optional import guard
+    from pydantic import BaseModel
+except Exception:  # pragma: no cover - fallback for runtime environments
+    class BaseModel:  # type: ignore[override]
+        pass
+
+
+def _to_jsonable(value: Any) -> Any:
+    if isinstance(value, BaseModel):
+        value = value.dict(by_alias=True)
+    if isinstance(value, dict):
+        return {key: _to_jsonable(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_jsonable(item) for item in value]
+    if isinstance(value, Decimal):
+        return str(value)
+    return value
+
+
+def _assert_jsonable(value: Any, ctx: str = "payload") -> None:
+    import json
+
+    json.dumps(_to_jsonable(value))
+
+
+def _format_decimal(value: float | Decimal) -> str:
+    return str(Decimal(str(value)))
 
 
 @dataclass
@@ -72,8 +101,34 @@ class GMOBroker:
 
     async def fetch_positions(self, symbol: str) -> Dict[str, Any]:
         async with self._client.get("/private/v1/openPositions", params={"symbol": symbol}) as resp:
-            data = await resp.json()
-            self._position_summary[symbol] = data
+            status_code = resp.status
+            try:
+                data = await resp.json()
+            except Exception:
+                text_body = await resp.text()
+                logger.error(
+                    "Failed to parse positions response",
+                    symbol=symbol,
+                    http_status=status_code,
+                    body_preview=text_body[:200],
+                )
+                raise RuntimeError("Failed to fetch positions")
+            if status_code >= 400:
+                messages = []
+                if isinstance(data, dict):
+                    messages = data.get("messages") or []
+                message_code = messages[0].get("message_code") if messages else None
+                message_string = messages[0].get("message_string") if messages else None
+                logger.error(
+                    "GMO openPositions failed",
+                    symbol=symbol,
+                    http_status=status_code,
+                    message_code=message_code,
+                    message_string=message_string,
+                )
+                raise RuntimeError(message_string or "Failed to fetch positions")
+            if isinstance(data, dict):
+                self._position_summary[symbol] = data
             return data
 
     def _should_retry(self, status_code: int) -> bool:
@@ -85,18 +140,41 @@ class GMOBroker:
         message_string: Optional[str] = None
         last_data: Dict[str, Any] = {}
         last_status = 0
+        payload = _to_jsonable(payload)
+        _assert_jsonable(payload, ctx=f"{context}-payload")
         for delay in delays:
             if delay:
                 await asyncio.sleep(delay)
             async with self._client.post(endpoint, json=payload) as resp:
                 status_code = resp.status
                 last_status = status_code
-                data = await resp.json()
+                try:
+                    data = await resp.json()
+                except Exception:
+                    text_body = await resp.text()
+                    data = {"raw": text_body}
+                if not isinstance(data, dict):
+                    data = {"data": data}
                 last_data = data
-                messages = data.get("messages") or []
+                messages = []
+                if isinstance(data, dict):
+                    messages = data.get("messages") or []
+                resp_message_code: Optional[str] = None
+                resp_message_string: Optional[str] = None
                 if messages:
-                    message_code = messages[0].get("message_code")
-                    message_string = messages[0].get("message_string")
+                    resp_message_code = messages[0].get("message_code")
+                    resp_message_string = messages[0].get("message_string")
+                    message_code = resp_message_code
+                    message_string = resp_message_string
+                logger_level = logger.info if status_code < 400 else logger.warning
+                logger_level(
+                    "GMO REST response",
+                    endpoint=endpoint,
+                    context=context,
+                    http_status=status_code,
+                    message_code=resp_message_code,
+                    message_string=resp_message_string,
+                )
                 if status_code < 400:
                     return OrderResult(True, status_code, data, message_code, message_string)
                 if not self._should_retry(status_code):
@@ -110,18 +188,18 @@ class GMOBroker:
     async def place_entry(self, symbol: str, side: str, size: float) -> OrderResult:
         payload = {
             "symbol": symbol,
-            "side": side,
+            "side": side.upper(),
             "executionType": "MARKET",
-            "size": size,
+            "size": _format_decimal(size),
         }
         return await self._place_order("/private/v1/order", payload, "entry")
 
     async def place_close(self, symbol: str, side: str, size: float) -> OrderResult:
         payload = {
             "symbol": symbol,
-            "side": side,
+            "side": side.upper(),
             "executionType": "MARKET",
-            "size": size,
+            "size": _format_decimal(size),
         }
         return await self._place_order("/private/v1/order", payload, "close")
 

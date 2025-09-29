@@ -41,3 +41,20 @@ class DiscordNotifier:
         except Exception as exc:
             logger.warning("Discord notification error", error=str(exc))
 
+    async def error(
+        self,
+        message: str,
+        *,
+        extra: Optional[Dict[str, Any]] = None,
+        embeds: Optional[list[Dict[str, Any]]] = None,
+    ) -> None:
+        safe_extra: Dict[str, Any] = {}
+        if extra:
+            for key, value in extra.items():
+                if isinstance(value, (str, int, float, bool)) or value is None:
+                    safe_extra[key] = value
+                else:
+                    safe_extra[key] = str(value)
+        logger.error(message, **safe_extra)
+        await self.send(message, embeds=embeds)
+

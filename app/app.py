@@ -368,7 +368,15 @@ async def webhook(payload: WebhookRequest, state: AppState = Depends(get_state))
         log.error("Unhandled webhook error", error=detail)
         result = OrderResult(False, 500, {}, None, detail)
         embeds = build_discord_embed(payload, result, latency_ms, status_text, detail)
-        await state.notifier.send(f"[{status_text}] {symbol_value}", embeds=embeds)
+        await state.notifier.error(
+            f"[{status_text}] {symbol_value}",
+            extra={
+                "event_id": payload.event_id,
+                "mode": payload.mode.value,
+                "symbol": symbol_value,
+            },
+            embeds=embeds,
+        )
         return WebhookResponse(status=status_text, detail=detail, event_id=payload.event_id)
 
 
