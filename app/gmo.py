@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional
 
-from aiohttp import WSMsgType
 import pybotters
 from loguru import logger
 
@@ -20,94 +19,44 @@ class OrderResult:
 
 class GMOBroker:
     BASE_URL = "https://api.coin.z.com"
-    WS_URL = "wss://api.coin.z.com/ws/private/v1"
 
-    def __init__(self, api_key: str, api_secret: str) -> None:
-        self._api_key = api_key
-        self._api_secret = api_secret
-        self._client_cm: Optional[pybotters.Client] = None
-        self._client: Optional[pybotters.Client] = None
-        self._ws_task: Optional[asyncio.Task] = None
-        self._ws_connected = asyncio.Event()
-        self._ws_stop = asyncio.Event()
+    def __init__(self, client: pybotters.Client) -> None:
+        self._client = client
         self._execution_event = asyncio.Event()
         self._latest_execution: Optional[Dict[str, Any]] = None
         self._position_summary: Dict[str, Any] = {}
         self.retry_entry = 0
         self.retry_close = 0
+        self._ws_connected = False
 
     @property
     def ws_connected(self) -> bool:
-        return self._ws_connected.is_set()
+        return self._ws_connected
 
     @property
     def position_summary(self) -> Dict[str, Any]:
         return self._position_summary
 
-    async def connect(self) -> None:
-        if self._client is not None:
-            return
-        self._client_cm = pybotters.Client(
-            apis={"gmocoin": [self._api_key, self._api_secret]},
-            base_url=self.BASE_URL,
-        )
-        self._client = await self._client_cm.__aenter__()
-        logger.info("GMOBroker client connected")
-        self._ws_task = asyncio.create_task(self._ws_worker())
+    async def on_ws_connected(self) -> None:
+        self._ws_connected = True
+
+    async def on_ws_disconnected(self) -> None:
+        self._ws_connected = False
+
+    async def handle_ws_message(self, message: Dict[str, Any]) -> None:
+        channel = message.get("channel")
+        data = message.get("data")
+        if channel == "executionEvents" and isinstance(data, dict):
+            self._latest_execution = message
+            self._execution_event.set()
+        elif channel == "positionSummaryEvents" and isinstance(data, dict):
+            symbol = data.get("symbol")
+            if symbol:
+                self._position_summary[symbol] = {"data": [data]}
 
     async def close(self) -> None:
-        self._ws_stop.set()
-        if self._ws_task:
-            await self._ws_task
-        if self._client_cm is not None:
-            await self._client_cm.__aexit__(None, None, None)
-            self._client_cm = None
-            self._client = None
-        logger.info("GMOBroker client closed")
-
-    async def _ws_worker(self) -> None:
-        if self._client is None:
-            return
-        while not self._ws_stop.is_set():
-            try:
-                async with self._client.ws_connect(self.WS_URL) as ws:
-                    await ws.send_json(
-                        {
-                            "command": "subscribe",
-                            "channel": "executionEvents",
-                            "symbol": "BTC_JPY",
-                        }
-                    )
-                    await ws.send_json(
-                        {
-                            "command": "subscribe",
-                            "channel": "positionSummaryEvents",
-                            "symbol": "BTC_JPY",
-                        }
-                    )
-                    self._ws_connected.set()
-                    async for msg in ws:
-                        if self._ws_stop.is_set():
-                            await ws.close()
-                            break
-                        if msg.type != WSMsgType.TEXT:
-                            continue
-                        data = msg.json()
-                        channel = data.get("channel")
-                        if channel == "executionEvents":
-                            self._latest_execution = data
-                            self._execution_event.set()
-                        elif channel == "positionSummaryEvents":
-                            summary = data.get("data", {})
-                            symbol = summary.get("symbol")
-                            if symbol:
-                                self._position_summary[symbol] = summary
-            except Exception as exc:
-                self._ws_connected.clear()
-                logger.warning("WS connection dropped", error=str(exc))
-                await asyncio.sleep(3)
-            else:
-                self._ws_connected.clear()
+        self._execution_event.set()
+        self._ws_connected = False
 
     async def wait_for_execution(self, order_id: str, timeout: float = 3.0) -> Optional[Dict[str, Any]]:
         try:
@@ -122,11 +71,7 @@ class GMOBroker:
             return None
 
     async def fetch_positions(self, symbol: str) -> Dict[str, Any]:
-        if self._client is None:
-            raise RuntimeError("GMOBroker client not connected")
-        async with self._client.get(
-            "/private/v1/openPositions", params={"symbol": symbol}
-        ) as resp:
+        async with self._client.get("/private/v1/openPositions", params={"symbol": symbol}) as resp:
             data = await resp.json()
             self._position_summary[symbol] = data
             return data
@@ -135,8 +80,6 @@ class GMOBroker:
         return status_code >= 500 or status_code == 429
 
     async def _place_order(self, endpoint: str, payload: Dict[str, Any], context: str) -> OrderResult:
-        if self._client is None:
-            raise RuntimeError("GMOBroker client not connected")
         delays = [0.0, 0.5, 1.0, 2.0]
         message_code: Optional[str] = None
         message_string: Optional[str] = None
@@ -185,4 +128,74 @@ class GMOBroker:
     async def close_bulk(self, symbol: str) -> OrderResult:
         payload = {"symbol": symbol}
         return await self._place_order("/private/v1/closeBulkOrder", payload, "close")
+
+
+async def _ws_worker(
+    pyb_client: pybotters.Client,
+    token: str,
+    on_message: Callable[[Dict[str, Any]], Awaitable[None]],
+    *,
+    stop_event: Optional[asyncio.Event] = None,
+    on_connect: Optional[Callable[[], Awaitable[None]]] = None,
+    on_disconnect: Optional[Callable[[], Awaitable[None]]] = None,
+) -> None:
+    urls = [
+        f"wss://api.coin.z.com/ws/private/v1?token={token}",
+        f"wss://api.coin.z.com/ws/private?token={token}",
+    ]
+    subscribe = {
+        "command": "subscribe",
+        "channel": [
+            {"name": "executionEvents"},
+            {"name": "positionSummaryEvents"},
+        ],
+    }
+    backoff = 1.0
+    while True:
+        if stop_event and stop_event.is_set():
+            logger.info("WS stop requested")
+            return
+        for url in urls:
+            if stop_event and stop_event.is_set():
+                logger.info("WS stop requested")
+                return
+            try:
+                async with pyb_client.ws_connect(url) as ws:
+                    await ws.send_json(subscribe)
+                    logger.info("WS connected: {}", url)
+                    if on_connect:
+                        await on_connect()
+                    backoff = 1.0
+                    async for msg in ws:
+                        if stop_event and stop_event.is_set():
+                            await ws.close()
+                            break
+                        msg_type = getattr(msg.type, "name", str(msg.type))
+                        if msg_type == "TEXT":
+                            try:
+                                data = msg.json()
+                            except Exception as exc:  # pragma: no cover - defensive
+                                logger.warning("WS message parse error", error=str(exc))
+                                continue
+                            try:
+                                await on_message(data)
+                            except Exception as exc:  # pragma: no cover - defensive
+                                logger.warning("WS on_message error", error=str(exc))
+                        elif msg_type in ("CLOSE", "CLOSED"):
+                            raise ConnectionError("WS closed by server")
+                if on_disconnect:
+                    await on_disconnect()
+            except asyncio.CancelledError:
+                if on_disconnect:
+                    await on_disconnect()
+                raise
+            except Exception as exc:
+                if on_disconnect:
+                    await on_disconnect()
+                logger.warning("WS connection dropped", url=url, error=str(exc))
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 15.0)
+                continue
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 15.0)
 

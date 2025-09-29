@@ -19,8 +19,10 @@ except Exception:  # pragma: no cover - optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from loguru import logger
+import pybotters
+from pybotters.helpers.gmocoin import GMOCoinHelper
 
-from .gmo import GMOBroker, OrderResult
+from .gmo import GMOBroker, OrderResult, _ws_worker
 from .models import (
     HealthResponse,
     LastEvent,
@@ -66,28 +68,39 @@ class Settings:
     timezone: str
     storage_path: Path
     version: Optional[str]
+    ws_enabled: bool
+    dry_run: bool
 
     @classmethod
     def load(cls) -> "Settings":
-        env = os.getenv("ENV", "prod")
-        allowed_symbols = [s.strip() for s in os.getenv("ALLOWED_SYMBOLS", "BTC_JPY").split(",") if s.strip()]
-        qty_step = Decimal(os.getenv("QTY_STEP", "0.01"))
-        timezone_name = os.getenv("TZ", "Asia/Tokyo")
+        env = os.getenv("ENV", "prod").strip()
+        allowed_symbols = [
+            s.strip()
+            for s in os.getenv("ALLOWED_SYMBOLS", "BTC_JPY").split(",")
+            if s.strip()
+        ]
+        qty_step = Decimal(os.getenv("QTY_STEP", "0.01").strip())
+        timezone_name = os.getenv("TZ", "Asia/Tokyo").strip()
         version = os.getenv("APP_VERSION") or get_git_revision()
-        storage_path = Path(os.getenv("IDEMPOTENCY_DB", "/app/data/idempotency.db"))
+        storage_path = Path(os.getenv("IDEMPOTENCY_DB", "/app/data/idempotency.db").strip())
+        discord_url = os.getenv("DISCORD_WEBHOOK_URL")
+        if discord_url is not None:
+            discord_url = discord_url.strip() or None
         settings = cls(
-            webhook_token=os.getenv("WEBHOOK_TOKEN", ""),
-            gmo_api_key=os.getenv("GMO_API_KEY", ""),
-            gmo_api_secret=os.getenv("GMO_API_SECRET", ""),
+            webhook_token=os.getenv("WEBHOOK_TOKEN", "").strip(),
+            gmo_api_key=os.getenv("GMO_API_KEY", "").strip(),
+            gmo_api_secret=os.getenv("GMO_API_SECRET", "").strip(),
             environment=env,
             allowed_symbols=allowed_symbols,
-            entry_policy=os.getenv("ENTRY_POLICY", "ignore"),
-            max_skew_seconds=int(os.getenv("MAX_SKEW_SECONDS", "60")),
+            entry_policy=os.getenv("ENTRY_POLICY", "ignore").strip(),
+            max_skew_seconds=int(os.getenv("MAX_SKEW_SECONDS", "60").strip()),
             qty_step=qty_step,
-            discord_webhook_url=os.getenv("DISCORD_WEBHOOK_URL"),
+            discord_webhook_url=discord_url,
             timezone=timezone_name,
             storage_path=storage_path,
             version=version,
+            ws_enabled=os.getenv("WS_ENABLED", "1").strip() == "1",
+            dry_run=os.getenv("DRY_RUN", "0").strip() == "1",
         )
         settings.validate()
         return settings
@@ -116,6 +129,9 @@ class AppState:
     notifier: DiscordNotifier
     broker: GMOBroker
     last_event: LastEvent
+    pybotters_client: pybotters.Client
+    ws_task: Optional[asyncio.Task]
+    ws_stop: Optional[asyncio.Event]
 
     def update_last_event(self, event_id: str, mode: Mode, ts: datetime, status: str, detail: str) -> None:
         self.last_event = LastEvent(
@@ -151,14 +167,14 @@ def get_state(request: Request) -> AppState:
 
 
 def parse_timestamp(value: str) -> datetime:
-    normalized = value.replace("Z", "+00:00")
+    ts_value = value.strip()
+    if not ts_value.endswith("Z") or "." in ts_value or "+" in ts_value:
+        raise HTTPException(status_code=400, detail="Invalid timestamp format")
     try:
-        ts = datetime.fromisoformat(normalized)
+        parsed = datetime.strptime(ts_value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail="Invalid ts format") from exc
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-    return ts.astimezone(timezone.utc)
+        raise HTTPException(status_code=400, detail="Invalid timestamp format") from exc
+    return parsed
 
 
 def floor_to_step(size: float, step: Decimal) -> float:
@@ -224,8 +240,33 @@ async def on_startup() -> None:
     await storage.initialize()
     notifier = DiscordNotifier(settings.discord_webhook_url)
     await notifier.start()
-    broker = GMOBroker(settings.gmo_api_key, settings.gmo_api_secret)
-    await broker.connect()
+    pyb_client = pybotters.Client(
+        apis={"gmocoin": [settings.gmo_api_key, settings.gmo_api_secret]},
+        base_url=GMOBroker.BASE_URL,
+    )
+    broker = GMOBroker(pyb_client)
+    ws_stop: Optional[asyncio.Event] = None
+    ws_task: Optional[asyncio.Task] = None
+    if settings.ws_enabled:
+        helper = GMOCoinHelper(pyb_client)
+        try:
+            token = await helper.ensure_token()
+        except Exception as exc:
+            logger.warning("Failed to acquire WS token", error=str(exc))
+        else:
+            ws_stop = asyncio.Event()
+            ws_task = asyncio.create_task(
+                _ws_worker(
+                    pyb_client,
+                    token,
+                    broker.handle_ws_message,
+                    stop_event=ws_stop,
+                    on_connect=broker.on_ws_connected,
+                    on_disconnect=broker.on_ws_disconnected,
+                )
+            )
+    else:
+        logger.info("WS disabled (WS_ENABLED=0)")
     try:
         await broker.fetch_positions(settings.allowed_symbols[0])
     except Exception as exc:
@@ -236,16 +277,33 @@ async def on_startup() -> None:
         notifier=notifier,
         broker=broker,
         last_event=LastEvent(event_id=None, mode=None, ts=None, status=None, detail=None),
+        pybotters_client=pyb_client,
+        ws_task=ws_task,
+        ws_stop=ws_stop,
     )
-    logger.info("Application startup complete", environment=settings.environment)
+    logger.info(
+        "Application startup complete",
+        environment=settings.environment,
+        dry_run=settings.dry_run,
+        ws_enabled=settings.ws_enabled,
+    )
 
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
     state: AppState = app.state.app_state
+    if state.ws_stop is not None:
+        state.ws_stop.set()
+    if state.ws_task is not None:
+        state.ws_task.cancel()
+        try:
+            await state.ws_task
+        except asyncio.CancelledError:
+            pass
     await state.notifier.close()
     await state.storage.close()
     await state.broker.close()
+    await state.pybotters_client.close()
     logger.info("Application shutdown complete")
 
 
@@ -276,9 +334,11 @@ async def status(state: AppState = Depends(get_state)) -> StatusResponse:
 @app.post("/webhook", response_model=WebhookResponse)
 async def webhook(payload: WebhookRequest, state: AppState = Depends(get_state)) -> WebhookResponse:
     settings = state.settings
-    if payload.token != settings.webhook_token:
+    token_value = payload.token.strip()
+    if not settings.webhook_token or token_value != settings.webhook_token:
         raise HTTPException(status_code=401, detail="Invalid token")
-    if payload.symbol not in settings.allowed_symbols:
+    symbol_value = payload.symbol.strip()
+    if symbol_value not in settings.allowed_symbols:
         raise HTTPException(status_code=400, detail="Unsupported symbol")
 
     event_ts = parse_timestamp(payload.ts)
@@ -288,16 +348,28 @@ async def webhook(payload: WebhookRequest, state: AppState = Depends(get_state))
         raise HTTPException(status_code=400, detail="Timestamp skew exceeded")
 
     is_new = await state.storage.register(payload.event_id)
-    log = logger.bind(event_id=payload.event_id, mode=payload.mode.value, symbol=payload.symbol)
+    log = logger.bind(event_id=payload.event_id, mode=payload.mode.value, symbol=symbol_value)
     if not is_new:
         log.info("Duplicate event ignored")
         return WebhookResponse(status="duplicate", detail="Event already processed", event_id=payload.event_id)
 
-    latency_ms = (now - event_ts).total_seconds() * 1000
+    latency_ms = (datetime.now(timezone.utc) - event_ts).total_seconds() * 1000
 
-    if payload.mode == Mode.ENTRY:
-        return await handle_entry(payload, state, latency_ms, log, event_ts)
-    return await handle_close(payload, state, latency_ms, log, event_ts)
+    try:
+        if payload.mode == Mode.ENTRY:
+            return await handle_entry(payload, state, latency_ms, log, event_ts)
+        return await handle_close(payload, state, latency_ms, log, event_ts)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        detail = str(exc)
+        status_text = f"{payload.mode.value} ERROR"
+        state.update_last_event(payload.event_id, payload.mode, event_ts, status_text, detail)
+        log.error("Unhandled webhook error", error=detail)
+        result = OrderResult(False, 500, {}, None, detail)
+        embeds = build_discord_embed(payload, result, latency_ms, status_text, detail)
+        await state.notifier.send(f"[{status_text}] {symbol_value}", embeds=embeds)
+        return WebhookResponse(status=status_text, detail=detail, event_id=payload.event_id)
 
 
 async def handle_entry(
@@ -309,9 +381,11 @@ async def handle_entry(
 ) -> WebhookResponse:
     settings = state.settings
     broker = state.broker
+    symbol = payload.symbol.strip()
+    payload.symbol = symbol
 
-    summary = await broker.fetch_positions(payload.symbol)
-    side, open_size = summarize_position(summary, payload.symbol)
+    summary = await broker.fetch_positions(symbol)
+    side, open_size = summarize_position(summary, symbol)
     if open_size > 0:
         log.info("Existing position detected, entry ignored", position_side=side, position_size=open_size)
         state.update_last_event(payload.event_id, payload.mode, event_ts, "ENTRY IGNORED", "Position already open")
@@ -321,7 +395,21 @@ async def handle_entry(
     if floored_size <= 0:
         raise HTTPException(status_code=400, detail="Size below minimum step")
 
-    result = await broker.place_entry(payload.symbol, payload.side or "BUY", floored_size)
+    if settings.dry_run:
+        status = "ENTRY DRY-RUN"
+        detail = "Dry-run mode active, order skipped"
+        state.update_last_event(payload.event_id, payload.mode, event_ts, status, detail)
+        log.bind(size=floored_size, side=payload.side).info(
+            "ENTRY skipped due to DRY_RUN",
+            latency_ms=latency_ms,
+            result=status,
+        )
+        result = OrderResult(True, 200, {}, None, "DRY RUN")
+        embeds = build_discord_embed(payload, result, latency_ms, status, detail)
+        await state.notifier.send(f"[{status}] {symbol}", embeds=embeds)
+        return WebhookResponse(status=status, detail=detail, event_id=payload.event_id)
+
+    result = await broker.place_entry(symbol, payload.side or "BUY", floored_size)
     status = "ENTRY OK" if result.success else "ENTRY ERROR"
     detail = "Order executed" if result.success else "Order failed"
     state.update_last_event(payload.event_id, payload.mode, event_ts, status, detail)
@@ -331,6 +419,7 @@ async def handle_entry(
         latency_ms=latency_ms,
         result=status,
         message_code=result.message_code,
+        message_string=result.message_string,
     )
 
     if result.success:
@@ -340,11 +429,11 @@ async def handle_entry(
             fill = await broker.wait_for_execution(order_id)
         if fill is None:
             try:
-                await broker.fetch_positions(payload.symbol)
+                await broker.fetch_positions(symbol)
             except Exception as exc:
                 log.warning("Post-entry position check failed", error=str(exc))
     embeds = build_discord_embed(payload, result, latency_ms, status, detail)
-    await state.notifier.send(f"[{status}] {payload.symbol}", embeds=embeds)
+    await state.notifier.send(f"[{status}] {symbol}", embeds=embeds)
     return WebhookResponse(status=status, detail=detail, event_id=payload.event_id)
 
 
@@ -357,16 +446,34 @@ async def handle_close(
 ) -> WebhookResponse:
     settings = state.settings
     broker = state.broker
+    symbol = payload.symbol.strip()
+    payload.symbol = symbol
 
-    summary = await broker.fetch_positions(payload.symbol)
-    side, open_size = summarize_position(summary, payload.symbol)
+    summary = await broker.fetch_positions(symbol)
+    side, open_size = summarize_position(summary, symbol)
     if open_size <= 0:
         log.info("No open position to close")
         state.update_last_event(payload.event_id, payload.mode, event_ts, "CLOSE OK", "No position")
         return WebhookResponse(status="CLOSE OK", detail="No open position", event_id=payload.event_id)
 
+    if settings.dry_run:
+        status = "CLOSE DRY-RUN"
+        detail = "Dry-run mode active, close skipped"
+        state.update_last_event(payload.event_id, payload.mode, event_ts, status, detail)
+        log.info(
+            "CLOSE skipped due to DRY_RUN",
+            latency_ms=latency_ms,
+            position_side=side,
+            position_size=open_size,
+            result=status,
+        )
+        result = OrderResult(True, 200, {}, None, "DRY RUN")
+        embeds = build_discord_embed(payload, result, latency_ms, status, detail)
+        await state.notifier.send(f"[{status}] {symbol}", embeds=embeds)
+        return WebhookResponse(status=status, detail=detail, event_id=payload.event_id)
+
     close_side = "SELL" if side == "BUY" else "BUY"
-    result = await broker.close_bulk(payload.symbol)
+    result = await broker.close_bulk(symbol)
     if not result.success:
         log.warning("closeBulkOrder failed, falling back to manual close", message_code=result.message_code)
         step_dec = settings.qty_step
@@ -374,7 +481,7 @@ async def handle_close(
         attempt_result: Optional[OrderResult] = None
         while remaining_dec > 0:
             remaining = float(remaining_dec)
-            attempt_result = await broker.place_close(payload.symbol, close_side, remaining)
+            attempt_result = await broker.place_close(symbol, close_side, remaining)
             if attempt_result.success:
                 result = attempt_result
                 break
@@ -396,13 +503,14 @@ async def handle_close(
         position_size=open_size,
         result=status,
         message_code=result.message_code,
+        message_string=result.message_string,
     )
     if result.success:
         try:
-            await broker.fetch_positions(payload.symbol)
+            await broker.fetch_positions(symbol)
         except Exception as exc:
             log.warning("Post-close position check failed", error=str(exc))
     embeds = build_discord_embed(payload, result, latency_ms, status, detail)
-    await state.notifier.send(f"[{status}] {payload.symbol}", embeds=embeds)
+    await state.notifier.send(f"[{status}] {symbol}", embeds=embeds)
     return WebhookResponse(status=status, detail=detail, event_id=payload.event_id)
 
