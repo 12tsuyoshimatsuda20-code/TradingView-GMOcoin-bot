@@ -3,12 +3,19 @@ from __future__ import annotations
 
 import os
 from functools import lru_cache
-from typing import Dict, List
+from typing import Any, Dict, List
 
-from pydantic import BaseSettings, Field, root_validator
+from pydantic import Field, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
     webhook_token: str = Field(..., env="WEBHOOK_TOKEN")
     gmo_api_key: str = Field(..., env="GMO_API_KEY")
     gmo_api_secret: str = Field(..., env="GMO_API_SECRET")
@@ -22,12 +29,9 @@ class Settings(BaseSettings):
 
     api_base: str = "https://api.coin.z.com"
 
-    class Config:
-        env_file = ".env"
-        case_sensitive = False
-
-    @root_validator(pre=True)
-    def populate_size_decimals(cls, values: Dict[str, str]) -> Dict[str, str]:
+    @model_validator(mode="before")
+    @classmethod
+    def populate_size_decimals(cls, values: Dict[str, Any]) -> Dict[str, Any]:
         prefix = "SIZE_DECIMALS_"
         mapping: Dict[str, int] = {}
         for key, value in os.environ.items():
@@ -37,16 +41,20 @@ class Settings(BaseSettings):
                     mapping[symbol] = int(value)
                 except ValueError as exc:  # pragma: no cover - configuration error
                     raise ValueError(f"Invalid decimal setting for {symbol}: {value}") from exc
-        values.setdefault("size_decimals", mapping)
+        if not values.get("size_decimals"):
+            values["size_decimals"] = mapping
         return values
 
-    @root_validator
-    def normalize_symbols(cls, values: Dict[str, object]) -> Dict[str, object]:
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_symbols(cls, values: Dict[str, Any]) -> Dict[str, Any]:
         symbols = values.get("allowed_symbols") or []
         if isinstance(symbols, str):
             symbols = [s.strip().upper() for s in symbols.split(",") if s.strip()]
-        else:
+        elif isinstance(symbols, (list, tuple, set)):
             symbols = [str(s).strip().upper() for s in symbols if str(s).strip()]
+        else:
+            symbols = [str(symbols).strip().upper()] if symbols else []
         values["allowed_symbols"] = symbols
         return values
 
